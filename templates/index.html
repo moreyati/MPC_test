@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>四回路 PID + 流量-温度仿真</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+    <style>
+        :root {
+            --bg: #0f1419;
+            --panel: #1a2332;
+            --border: #2d3a4f;
+            --text: #e6edf3;
+            --muted: #8b949e;
+            --accent: #58a6ff;
+            --success: #3fb950;
+            --danger: #f85149;
+            --warning: #d29922;
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin: 0 0 20px 0;
+            color: var(--text);
+        }
+        .layout {
+            display: grid;
+            grid-template-columns: 1fr 440px;
+            gap: 20px;
+            max-width: 1680px;
+            margin: 0 auto;
+        }
+        @media (max-width: 1100px) {
+            .layout { grid-template-columns: 1fr; }
+        }
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .panel h2 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            margin: 0 0 12px 0;
+            color: var(--muted);
+        }
+        .chart-wrap { height: 280px; position: relative; }
+        .chart-hint { font-size: 0.7rem; color: var(--muted); margin-top: 4px; }
+        .readings-table {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        .readings-table .cell {
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            padding: 10px;
+            text-align: center;
+        }
+        .readings-table .cell .label { font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }
+        .readings-table .cell .value { font-size: 1.1rem; font-weight: 600; }
+        .readings-table .cell .value.sp { color: #58a6ff; }
+        .readings-table .cell .value.flow { color: #3fb950; }
+        .readings-table .cell .value.temp { color: #d29922; }
+        .unit { font-size: 0.7rem; color: var(--muted); margin-left: 2px; }
+        label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 4px; }
+        input[type="number"] {
+            width: 100%;
+            padding: 6px 8px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 0.9rem;
+        }
+        .form-row { margin-bottom: 10px; }
+        .loop-row {
+            display: grid;
+            grid-template-columns: 80px 1fr 1fr 1fr;
+            gap: 8px;
+            align-items: end;
+            margin-bottom: 8px;
+        }
+        .loop-row.setpoints { grid-template-columns: 60px 1fr 1fr 1fr 1fr; }
+        .loop-row .loop-label { font-size: 0.85rem; color: var(--muted); padding-bottom: 6px; }
+        .btn {
+            display: inline-block;
+            padding: 8px 14px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-start { background: var(--success); color: #fff; }
+        .btn-stop { background: var(--danger); color: #fff; }
+        .btn-reset { background: var(--border); color: var(--text); }
+        .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.85rem;
+            margin-bottom: 12px;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--muted);
+        }
+        .status-dot.running { background: var(--success); animation: pulse 1s infinite; }
+        @keyframes pulse { 50% { opacity: 0.6; } }
+        .panel-right { min-height: 580px; overflow-y: auto; }
+        .mode-row { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+        .btn-mode { background: var(--border); color: var(--text); }
+        .btn-mode.active { background: var(--accent); color: #fff; }
+        .section-flow-setpoints.disabled .loop-row.setpoints input { opacity: 0.7; pointer-events: none; }
+        .section-flow-setpoints .readonly-hint { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
+    </style>
+</head>
+<body>
+    <h1>四回路 PID + 流量-温度仿真 · 支持 MPC+PID 串级 · 0–60 000 Nm³/h · 0–600 ℃</h1>
+    <div class="layout">
+        <div class="panel">
+            <div class="status">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">未运行</span>
+            </div>
+            <div class="readings-table">
+                <div class="cell"><div class="label">回路1 设定值</div><div class="value sp" id="dispSp0">12500<span class="unit">Nm³/h</span></div></div>
+                <div class="cell"><div class="label">回路2 设定值</div><div class="value sp" id="dispSp1">12500<span class="unit">Nm³/h</span></div></div>
+                <div class="cell"><div class="label">回路3 设定值</div><div class="value sp" id="dispSp2">12500<span class="unit">Nm³/h</span></div></div>
+                <div class="cell"><div class="label">回路4 设定值</div><div class="value sp" id="dispSp3">12500<span class="unit">Nm³/h</span></div></div>
+                <div class="cell"><div class="label">回路1 流量</div><div class="value flow" id="dispFlow0">12500<span class="unit">Nm³/h</span></div></div>
+                <div class="cell"><div class="label">回路2 流量</div><div class="value flow" id="dispFlow1">12500<span class="unit">Nm³/h</span></div></div>
+                <div class="cell"><div class="label">回路3 流量</div><div class="value flow" id="dispFlow2">12500<span class="unit">Nm³/h</span></div></div>
+                <div class="cell"><div class="label">回路4 流量</div><div class="value flow" id="dispFlow3">12500<span class="unit">Nm³/h</span></div></div>
+                <div class="cell"><div class="label">温度1</div><div class="value temp" id="dispTemp0">500<span class="unit">℃</span></div></div>
+                <div class="cell"><div class="label">温度2</div><div class="value temp" id="dispTemp1">500<span class="unit">℃</span></div></div>
+                <div class="cell"><div class="label">温度3</div><div class="value temp" id="dispTemp2">500<span class="unit">℃</span></div></div>
+                <div class="cell"><div class="label">温度4</div><div class="value temp" id="dispTemp3">500<span class="unit">℃</span></div></div>
+            </div>
+            <div class="chart-wrap">
+                <canvas id="chartFlow"></canvas>
+                <div class="chart-hint">滚轮缩放 · 按住左键拖拽平移 · 双击恢复视图</div>
+            </div>
+            <div class="chart-wrap">
+                <canvas id="chartTemp"></canvas>
+                <div class="chart-hint">滚轮缩放 · 按住左键拖拽平移 · 双击恢复视图</div>
+            </div>
+        </div>
+        <div class="panel panel-right">
+            <h2>控制模式</h2>
+            <div class="mode-row">
+                <button type="button" class="btn btn-mode" id="btnModePid" data-mode="pid_only">仅 PID（手动流量设定）</button>
+                <button type="button" class="btn btn-mode" id="btnModeMpc" data-mode="mpc_cascade">MPC+PID 串级（温度设定）</button>
+            </div>
+
+            <h2>温度设定值 (0–600 ℃)</h2>
+            <div class="loop-row setpoints">
+                <span class="loop-label">回路</span>
+                <div><label>1</label><input type="number" id="Tsetpoint0" min="0" max="600" value="500" step="1"></div>
+                <div><label>2</label><input type="number" id="Tsetpoint1" min="0" max="600" value="500" step="1"></div>
+                <div><label>3</label><input type="number" id="Tsetpoint2" min="0" max="600" value="500" step="1"></div>
+                <div><label>4</label><input type="number" id="Tsetpoint3" min="0" max="600" value="500" step="1"></div>
+            </div>
+
+            <h2>流量设定值 (0–60 000 Nm³/h)</h2>
+            <div class="section-flow-setpoints" id="sectionFlowSetpoints">
+                <div class="loop-row setpoints">
+                    <span class="loop-label">回路</span>
+                    <div><label>1</label><input type="number" id="setpoint0" min="0" max="60000" value="12500" step="100"></div>
+                    <div><label>2</label><input type="number" id="setpoint1" min="0" max="60000" value="12500" step="100"></div>
+                    <div><label>3</label><input type="number" id="setpoint2" min="0" max="60000" value="12500" step="100"></div>
+                    <div><label>4</label><input type="number" id="setpoint3" min="0" max="60000" value="12500" step="100"></div>
+                </div>
+                <div class="readonly-hint" id="flowSetpointHint" style="display:none;">串级模式下由 MPC 自动下发，仅显示</div>
+            </div>
+
+            <h2>PID 参数 (Kp, Ki, Kd ≥ 0)</h2>
+            <div class="loop-row">
+                <span class="loop-label">回路1</span>
+                <div><label>Kp</label><input type="number" id="Kp0" min="0" step="0.01" value="10"></div>
+                <div><label>Ki</label><input type="number" id="Ki0" min="0" step="0.01" value="5"></div>
+                <div><label>Kd</label><input type="number" id="Kd0" min="0" step="0.01" value="0"></div>
+            </div>
+            <div class="loop-row">
+                <span class="loop-label">回路2</span>
+                <div><label>Kp</label><input type="number" id="Kp1" min="0" step="0.01" value="10"></div>
+                <div><label>Ki</label><input type="number" id="Ki1" min="0" step="0.01" value="5"></div>
+                <div><label>Kd</label><input type="number" id="Kd1" min="0" step="0.01" value="0"></div>
+            </div>
+            <div class="loop-row">
+                <span class="loop-label">回路3</span>
+                <div><label>Kp</label><input type="number" id="Kp2" min="0" step="0.01" value="10"></div>
+                <div><label>Ki</label><input type="number" id="Ki2" min="0" step="0.01" value="5"></div>
+                <div><label>Kd</label><input type="number" id="Kd2" min="0" step="0.01" value="0"></div>
+            </div>
+            <div class="loop-row">
+                <span class="loop-label">回路4</span>
+                <div><label>Kp</label><input type="number" id="Kp3" min="0" step="0.01" value="10"></div>
+                <div><label>Ki</label><input type="number" id="Ki3" min="0" step="0.01" value="5"></div>
+                <div><label>Kd</label><input type="number" id="Kd3" min="0" step="0.01" value="0"></div>
+            </div>
+            <div class="btn-row">
+                <button class="btn btn-start" id="btnApplyParams">应用全部 PID 参数</button>
+            </div>
+
+            <h2>仿真控制</h2>
+            <div class="btn-row">
+                <button class="btn btn-start" id="btnStart">开始仿真</button>
+                <button class="btn btn-stop" id="btnStop" disabled>停止仿真</button>
+                <button class="btn btn-reset" id="btnReset">重置</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const FLOW_MIN = 0;
+        const FLOW_MAX = 60000;
+        const API = "";
+        const NUM_LOOPS = 4;
+        const FLOW_Y_INIT = { min: 10000, max: 30000 };
+        const TEMP_Y_INIT = { min: 450, max: 550 };
+        const FLOW_Y_PHYS = { min: 0, max: 60000 };
+        const TEMP_Y_PHYS = { min: 0, max: 600 };
+        const COLORS_SP = ["#2563eb", "#16a34a", "#ea580c", "#dc2626"];
+        const COLORS_FLOW = ["#3b82f6", "#22c55e", "#f97316", "#ef4444"];
+        const COLORS_TEMP = ["#6366f1", "#14b8a6", "#f59e0b", "#ec4899"];
+
+        const statusDot = document.getElementById("statusDot");
+        const statusText = document.getElementById("statusText");
+        const dispSp = [document.getElementById("dispSp0"), document.getElementById("dispSp1"), document.getElementById("dispSp2"), document.getElementById("dispSp3")];
+        const dispFlow = [document.getElementById("dispFlow0"), document.getElementById("dispFlow1"), document.getElementById("dispFlow2"), document.getElementById("dispFlow3")];
+        const dispTemp = [document.getElementById("dispTemp0"), document.getElementById("dispTemp1"), document.getElementById("dispTemp2"), document.getElementById("dispTemp3")];
+        const setpointInputs = [document.getElementById("setpoint0"), document.getElementById("setpoint1"), document.getElementById("setpoint2"), document.getElementById("setpoint3")];
+        const KpInputs = [document.getElementById("Kp0"), document.getElementById("Kp1"), document.getElementById("Kp2"), document.getElementById("Kp3")];
+        const KiInputs = [document.getElementById("Ki0"), document.getElementById("Ki1"), document.getElementById("Ki2"), document.getElementById("Ki3")];
+        const KdInputs = [document.getElementById("Kd0"), document.getElementById("Kd1"), document.getElementById("Kd2"), document.getElementById("Kd3")];
+        const btnStart = document.getElementById("btnStart");
+        const btnStop = document.getElementById("btnStop");
+        const btnReset = document.getElementById("btnReset");
+        const btnApplyParams = document.getElementById("btnApplyParams");
+        const btnModePid = document.getElementById("btnModePid");
+        const btnModeMpc = document.getElementById("btnModeMpc");
+        const TsetpointInputs = [document.getElementById("Tsetpoint0"), document.getElementById("Tsetpoint1"), document.getElementById("Tsetpoint2"), document.getElementById("Tsetpoint3")];
+        const sectionFlowSetpoints = document.getElementById("sectionFlowSetpoints");
+        const flowSetpointHint = document.getElementById("flowSetpointHint");
+
+        let paramInputsSyncedOnce = false;
+        let setpointInputsSyncedOnce = false;
+        let TsetpointInputsSyncedOnce = false;
+
+        function formatNum(v) {
+            const n = Number(v);
+            return (n % 1 === 0 ? n : n.toFixed(2)).toLocaleString();
+        }
+
+        const flowDatasets = [];
+        for (let i = 0; i < NUM_LOOPS; i++) {
+            flowDatasets.push({ label: "设定" + (i + 1), data: [], borderColor: COLORS_SP[i], borderDash: [6, 4], fill: false, tension: 0.1, pointRadius: 0 });
+            flowDatasets.push({ label: "流量" + (i + 1), data: [], borderColor: COLORS_FLOW[i], fill: false, tension: 0.1, pointRadius: 0 });
+        }
+        const chartFlow = new Chart(document.getElementById("chartFlow"), {
+            type: "line",
+            data: { labels: [], datasets: flowDatasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { mode: "index", intersect: false },
+                scales: {
+                    x: { title: { display: true, text: "时间 (s)", color: "#8b949e" }, grid: { color: "#2d3a4f" }, ticks: { color: "#8b949e", maxTicksLimit: 10 } },
+                    y: { min: FLOW_Y_INIT.min, max: FLOW_Y_INIT.max, title: { display: true, text: "流量 (Nm³/h)", color: "#8b949e" }, grid: { color: "#2d3a4f" }, ticks: { color: "#8b949e" } },
+                },
+                plugins: {
+                    legend: { labels: { color: "#e6edf3", usePointStyle: true, boxWidth: 10 } },
+                    zoom: {
+                        zoom: {
+                            wheel: { enabled: true }, pinch: { enabled: true }, mode: "xy",
+                            onZoomComplete: ({ chart }) => { chart.userHasZoomed = true; },
+                        },
+                        pan: {
+                            enabled: true, mode: "xy",
+                            onPanComplete: ({ chart }) => { chart.userHasZoomed = true; },
+                        },
+                        limits: { x: { min: "original", max: "original" }, y: { min: FLOW_Y_PHYS.min, max: FLOW_Y_PHYS.max } },
+                    },
+                },
+            },
+        });
+        chartFlow.userHasZoomed = false;
+
+        const tempDatasets = [];
+        for (let i = 0; i < NUM_LOOPS; i++) {
+            tempDatasets.push({ label: "温度" + (i + 1), data: [], borderColor: COLORS_TEMP[i], fill: false, tension: 0.1, pointRadius: 2 });
+        }
+        const chartTemp = new Chart(document.getElementById("chartTemp"), {
+            type: "line",
+            data: { labels: [], datasets: tempDatasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { mode: "index", intersect: false },
+                scales: {
+                    x: { title: { display: true, text: "时间 (s)", color: "#8b949e" }, grid: { color: "#2d3a4f" }, ticks: { color: "#8b949e", maxTicksLimit: 10 } },
+                    y: { min: TEMP_Y_INIT.min, max: TEMP_Y_INIT.max, title: { display: true, text: "温度 (℃)", color: "#8b949e" }, grid: { color: "#2d3a4f" }, ticks: { color: "#8b949e" } },
+                },
+                plugins: {
+                    legend: { labels: { color: "#e6edf3", usePointStyle: true } },
+                    zoom: {
+                        zoom: {
+                            wheel: { enabled: true }, pinch: { enabled: true }, mode: "xy",
+                            onZoomComplete: ({ chart }) => { chart.userHasZoomed = true; },
+                        },
+                        pan: {
+                            enabled: true, mode: "xy",
+                            onPanComplete: ({ chart }) => { chart.userHasZoomed = true; },
+                        },
+                        limits: { x: { min: "original", max: "original" }, y: { min: TEMP_Y_PHYS.min, max: TEMP_Y_PHYS.max } },
+                    },
+                },
+            },
+        });
+        chartTemp.userHasZoomed = false;
+
+        function updateFlowScale() {
+            let lo = FLOW_Y_INIT.min, hi = FLOW_Y_INIT.max;
+            chartFlow.data.datasets.forEach((ds) => {
+                if (ds.data && ds.data.length) {
+                    const vMin = Math.min(...ds.data);
+                    const vMax = Math.max(...ds.data);
+                    lo = Math.min(lo, vMin);
+                    hi = Math.max(hi, vMax);
+                }
+            });
+            const pad = Math.max(500, (hi - lo) * 0.02);
+            chartFlow.options.scales.y.min = Math.max(FLOW_Y_PHYS.min, lo - pad);
+            chartFlow.options.scales.y.max = Math.min(FLOW_Y_PHYS.max, hi + pad);
+        }
+        function updateTempScale() {
+            let lo = TEMP_Y_INIT.min, hi = TEMP_Y_INIT.max;
+            chartTemp.data.datasets.forEach((ds) => {
+                if (ds.data && ds.data.length) {
+                    const vMin = Math.min(...ds.data);
+                    const vMax = Math.max(...ds.data);
+                    lo = Math.min(lo, vMin);
+                    hi = Math.max(hi, vMax);
+                }
+            });
+            const pad = Math.max(2, (hi - lo) * 0.02);
+            chartTemp.options.scales.y.min = Math.max(TEMP_Y_PHYS.min, lo - pad);
+            chartTemp.options.scales.y.max = Math.min(TEMP_Y_PHYS.max, hi + pad);
+        }
+
+        btnModePid.addEventListener("click", () => {
+            fetch(API + "/api/control_mode", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ control_mode: "pid_only" }) })
+                .then((r) => r.json()).then((d) => { if (d.ok) updateControlModeUI("pid_only"); }).catch(() => {});
+        });
+        btnModeMpc.addEventListener("click", () => {
+            fetch(API + "/api/control_mode", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ control_mode: "mpc_cascade" }) })
+                .then((r) => r.json()).then((d) => { if (d.ok) updateControlModeUI("mpc_cascade"); }).catch(() => {});
+        });
+
+        TsetpointInputs.forEach((inp, i) => {
+            inp.addEventListener("change", () => {
+                const v = Math.max(0, Math.min(600, Number(inp.value) || 0));
+                inp.value = v;
+                const arr = TsetpointInputs.map((e) => Math.max(0, Math.min(600, Number(e.value) || 0)));
+                fetch(API + "/api/t_setpoints", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ T_setpoints: arr }) }).catch(() => {});
+            });
+        });
+
+        setpointInputs.forEach((inp, i) => {
+            inp.addEventListener("change", () => {
+                const v = Math.max(FLOW_MIN, Math.min(FLOW_MAX, Number(inp.value) || 0));
+                inp.value = v;
+                fetch(API + "/api/setpoint", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ index: i, setpoint: v }),
+                }).catch(() => {});
+            });
+        });
+
+        function updateControlModeUI(mode) {
+            btnModePid.classList.toggle("active", mode === "pid_only");
+            btnModeMpc.classList.toggle("active", mode === "mpc_cascade");
+            sectionFlowSetpoints.classList.toggle("disabled", mode === "mpc_cascade");
+            flowSetpointHint.style.display = mode === "mpc_cascade" ? "block" : "none";
+            setpointInputs.forEach((inp) => { inp.disabled = (mode === "mpc_cascade"); });
+        }
+
+        btnApplyParams.addEventListener("click", () => {
+            const Kp = KpInputs.map((e) => Math.max(0, Number(e.value) || 0));
+            const Ki = KiInputs.map((e) => Math.max(0, Number(e.value) || 0));
+            const Kd = KdInputs.map((e) => Math.max(0, Number(e.value) || 0));
+            fetch(API + "/api/params", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ Kp, Ki, Kd }),
+            })
+                .then((r) => r.json())
+                .then((d) => {
+                    if (d.ok) {
+                        d.Kp.forEach((v, i) => { KpInputs[i].value = v; });
+                        d.Ki.forEach((v, i) => { KiInputs[i].value = v; });
+                        d.Kd.forEach((v, i) => { KdInputs[i].value = v; });
+                    }
+                })
+                .catch(() => {});
+        });
+
+        btnStart.addEventListener("click", () => {
+            fetch(API + "/api/start", { method: "POST" }).then(() => updateButtons(true)).catch(() => {});
+        });
+        btnStop.addEventListener("click", () => {
+            fetch(API + "/api/stop", { method: "POST" }).then(() => updateButtons(false)).catch(() => {});
+        });
+        btnReset.addEventListener("click", () => {
+            fetch(API + "/api/reset", { method: "POST" })
+                .then(() => {
+                    updateButtons(false);
+                    setpointInputsSyncedOnce = false;
+                    TsetpointInputsSyncedOnce = false;
+                    setpointInputs.forEach((e) => { e.value = 12500; });
+                    TsetpointInputs.forEach((e) => { e.value = 500; });
+                    fetch(API + "/api/setpoint", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ setpoints: [12500, 12500, 12500, 12500] }),
+                    }).catch(() => {});
+                    fetch(API + "/api/t_setpoints", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ T_setpoints: [500, 500, 500, 500] }),
+                    }).catch(() => {});
+                    chartFlow.data.labels = [];
+                    chartFlow.data.datasets.forEach((ds) => (ds.data = []));
+                    chartTemp.data.labels = [];
+                    chartTemp.data.datasets.forEach((ds) => (ds.data = []));
+                    chartFlow.options.scales.y.min = FLOW_Y_INIT.min;
+                    chartFlow.options.scales.y.max = FLOW_Y_INIT.max;
+                    chartTemp.options.scales.y.min = TEMP_Y_INIT.min;
+                    chartTemp.options.scales.y.max = TEMP_Y_INIT.max;
+                    chartFlow.userHasZoomed = false;
+                    chartTemp.userHasZoomed = false;
+                    chartFlow.update("none");
+                    chartTemp.update("none");
+                    if (typeof chartFlow.resetZoom === "function") chartFlow.resetZoom();
+                    if (typeof chartTemp.resetZoom === "function") chartTemp.resetZoom();
+                })
+                .catch(() => {});
+        });
+
+        function updateButtons(running) {
+            btnStart.disabled = running;
+            btnStop.disabled = !running;
+            statusDot.classList.toggle("running", running);
+            statusText.textContent = running ? "仿真运行中" : "已停止";
+        }
+
+        function poll() {
+            fetch(API + "/api/state")
+                .then((r) => r.json())
+                .then((data) => {
+                    for (let i = 0; i < NUM_LOOPS; i++) {
+                        dispSp[i].innerHTML = formatNum(data.setpoints[i]) + "<span class=\"unit\">Nm³/h</span>";
+                        dispFlow[i].innerHTML = formatNum(data.flows[i]) + "<span class=\"unit\">Nm³/h</span>";
+                        dispTemp[i].innerHTML = formatNum(data.temperatures[i]) + "<span class=\"unit\">℃</span>";
+                    }
+                    updateButtons(data.running);
+                    if (data.control_mode) updateControlModeUI(data.control_mode);
+                    if (data.T_setpoints && data.T_setpoints.length === NUM_LOOPS && !TsetpointInputsSyncedOnce) {
+                        for (let i = 0; i < NUM_LOOPS; i++) TsetpointInputs[i].value = data.T_setpoints[i];
+                        TsetpointInputsSyncedOnce = true;
+                    }
+                    if (data.control_mode === "mpc_cascade") {
+                        for (let i = 0; i < NUM_LOOPS; i++) setpointInputs[i].value = data.setpoints[i];
+                    } else if (!setpointInputsSyncedOnce) {
+                        for (let i = 0; i < NUM_LOOPS; i++) setpointInputs[i].value = data.setpoints[i];
+                        setpointInputsSyncedOnce = true;
+                    }
+                    if (!paramInputsSyncedOnce) {
+                        for (let i = 0; i < NUM_LOOPS; i++) {
+                            KpInputs[i].value = data.Kp[i];
+                            KiInputs[i].value = data.Ki[i];
+                            KdInputs[i].value = data.Kd[i];
+                        }
+                        paramInputsSyncedOnce = true;
+                    }
+
+                    const hf = data.history_flow || [];
+                    if (hf.length) {
+                        chartFlow.data.labels = hf.map((x) => x.time);
+                        for (let i = 0; i < NUM_LOOPS; i++) {
+                            chartFlow.data.datasets[i * 2].data = hf.map((x) => x.setpoints[i]);
+                            chartFlow.data.datasets[i * 2 + 1].data = hf.map((x) => x.flows[i]);
+                        }
+                        if (!chartFlow.userHasZoomed) updateFlowScale();
+                        chartFlow.update("none");
+                    }
+                    const ht = data.history_temp || [];
+                    if (ht.length > 0) {
+                        chartTemp.data.labels = ht.map((x) => x.time);
+                        for (let i = 0; i < NUM_LOOPS; i++) {
+                            chartTemp.data.datasets[i].data = ht.map((x) => x.temperatures[i]);
+                        }
+                        if (!chartTemp.userHasZoomed) updateTempScale();
+                        chartTemp.update("none");
+                    } else if (data.temperatures && Array.isArray(data.temperatures) && data.temperatures.length === NUM_LOOPS) {
+                        chartTemp.data.labels = [0];
+                        for (let i = 0; i < NUM_LOOPS; i++) {
+                            chartTemp.data.datasets[i].data = [Number(data.temperatures[i])];
+                        }
+                        if (!chartTemp.userHasZoomed) updateTempScale();
+                        chartTemp.update("none");
+                    }
+                })
+                .catch(() => {});
+        }
+
+        setInterval(poll, 200);
+        poll();
+    </script>
+</body>
+</html>
