@@ -17,7 +17,7 @@ from flask import Flask, render_template, jsonify, request
 
 from controlled_model import MIMOFOPDTPlant
 from MPC_controller import PriorityMPCController
-from valve_flow_model import ValveFlowModel, valve_limit
+from valve_flow_model import ValveFlowModel, valve_limit, valve_dead_zone
 
 app = Flask(__name__)
 
@@ -54,6 +54,9 @@ _state = {
     "temperatures": [500.0] * NUM_LOOPS,
     "control_mode": "pid_only",       # "pid_only" | "mpc_cascade"
     "T_setpoints": [500.0] * NUM_LOOPS,
+    "temperature_noise_std": 0.3,     # 温度反馈噪声标准差 (℃)
+    "flow_noise_std": 50,            # 流量反馈噪声标准差 (Nm³/h)
+    "valve_dead_zone_half_width": 100,  # 阀门死区半宽 (Nm³/h)，中心跟随设定值
 }
 _history_flow = []
 _history_temp = []
@@ -95,20 +98,22 @@ def run_simulation():
 
             t = _state["time"]
             setpoints = list(_state["setpoints"])
-            flows = list(_state["flows"])  # Fcv，来自 Gp2 上一步输出
+            flows = list(_state["flows"])  # Fcv 测量值（含噪声），用于内环反馈
             Kp = list(_state["Kp"])
             Ki = list(_state["Ki"])
             Kd = list(_state["Kd"])
             integrals = list(_state["integrals"])
             last_errors = list(_state["last_errors"])
             last_times = list(_state["last_times"])
+            flow_noise_std = float(_state.get("flow_noise_std", 0) or 0)
+            dead_zone_hw = float(_state.get("valve_dead_zone_half_width", 0) or 0)
 
         controls = [0.0] * NUM_LOOPS
         dt = SAMPLE_TIME
 
         for i in range(NUM_LOOPS):
             sp = setpoints[i]
-            fcv = flows[i]  # 内环反馈为 Gp2 输出 Fcv
+            fcv = flows[i]  # 内环反馈为流量测量值（含噪声）
             integral = integrals[i]
             last_error = last_errors[i]
             last_time = last_times[i]
@@ -125,10 +130,20 @@ def run_simulation():
             last_errors[i] = error
             last_times[i] = t
 
-        # Gv：阀门限幅（controls 为 PID 输出，u_limited 为实际送入 Gp2 的阀门指令）
-        u_limited = valve_limit(np.array(controls), FLOW_MIN, FLOW_MAX)
-        # Gp2：阀门-流量一步，得到本步 Fcv
-        flows_new = list(_valve_flow.step(u_limited))
+        # Gv：死区（中心=设定值）→ 限幅
+        u_after_dead = valve_dead_zone(np.array(controls), np.array(setpoints), dead_zone_hw)
+        u_limited = valve_limit(u_after_dead, FLOW_MIN, FLOW_MAX)
+        # Gp2：阀门-流量一步，得到本步真实流量 Fcv_true
+        Fcv_true = _valve_flow.step(u_limited)
+        # 流量测量值 = 真实流量 + 噪声（仅用于 PID 反馈与显示；Gp1 用真实流量）
+        if flow_noise_std > 0:
+            flows_measured = np.clip(
+                Fcv_true + np.random.randn(4) * flow_noise_std,
+                FLOW_MIN, FLOW_MAX
+            )
+        else:
+            flows_measured = Fcv_true
+        flows_new = list(flows_measured)
 
         with _lock:
             _state["flows"] = flows_new
@@ -149,9 +164,11 @@ def run_simulation():
         step_count += 1
         if step_count >= PLANT_STEPS_PER_CALL:
             step_count = 0
+            # Gp1 与 MPC 状态使用真实流量 Fcv_true（本步）
+            F = Fcv_true
             with _lock:
-                F = np.array([float(_state["flows"][j]) for j in range(NUM_LOOPS)])
-            T = _plant.step(F, noise_std=0.0, enforce_total_flow=(10000.0, 80000.0))
+                temp_noise_std = float(_state.get("temperature_noise_std", 0) or 0)
+            T = _plant.step(F, noise_std=temp_noise_std, enforce_total_flow=(10000.0, 80000.0))
             with _lock:
                 _state["temperatures"] = [round(float(T[j]), 2) for j in range(NUM_LOOPS)]
                 _history_temp.append({
@@ -160,7 +177,7 @@ def run_simulation():
                 })
                 if len(_history_temp) > _MAX_HISTORY_TEMP:
                     _history_temp.pop(0)
-                # 方案 A：与 controller_model 状态空间同步更新
+                # 方案 A：与 controller_model 状态空间同步更新（基于真实流量 F）
                 dF = F - _mpc_controller.F0
                 _mpc_state_x[:] = _mpc_controller.A @ _mpc_state_x + _mpc_controller.B @ dF
                 cascade = _state["control_mode"] == "mpc_cascade"
@@ -206,6 +223,9 @@ def api_state():
             "Kd": list(_state["Kd"]),
             "control_mode": _state["control_mode"],
             "T_setpoints": list(_state["T_setpoints"]),
+            "temperature_noise_std": _state.get("temperature_noise_std", 0.0),
+            "flow_noise_std": _state.get("flow_noise_std", 0.0),
+            "valve_dead_zone_half_width": _state.get("valve_dead_zone_half_width", 0.0),
             "history_flow": list(_history_flow),
             "history_temp": list(_history_temp),
         }
@@ -257,6 +277,31 @@ def api_setpoint():
             return jsonify({"ok": True, "setpoints": list(_state["setpoints"])})
     except (TypeError, ValueError, IndexError):
         return jsonify({"ok": False, "error": "无效设定值"}), 400
+
+
+@app.route("/api/simulation_params", methods=["POST"])
+def api_simulation_params():
+    """仿真可调参数：温度/流量噪声标准差、阀门死区半宽（死区中心跟随设定值）。"""
+    data = request.get_json() or {}
+    try:
+        with _lock:
+            if "temperature_noise_std" in data:
+                v = max(0.0, float(data["temperature_noise_std"]))
+                _state["temperature_noise_std"] = min(10.0, v)
+            if "flow_noise_std" in data:
+                v = max(0.0, float(data["flow_noise_std"]))
+                _state["flow_noise_std"] = min(1000.0, v)
+            if "valve_dead_zone_half_width" in data:
+                v = max(0.0, float(data["valve_dead_zone_half_width"]))
+                _state["valve_dead_zone_half_width"] = min(30000.0, v)
+            return jsonify({
+                "ok": True,
+                "temperature_noise_std": _state.get("temperature_noise_std", 0.0),
+                "flow_noise_std": _state.get("flow_noise_std", 0.0),
+                "valve_dead_zone_half_width": _state.get("valve_dead_zone_half_width", 0.0),
+            })
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "无效参数"}), 400
 
 
 @app.route("/api/params", methods=["POST"])

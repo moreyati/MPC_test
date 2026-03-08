@@ -1,12 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-阀门-流量模型（内环副对象 Gp2）+ 阀门环节 Gv（限幅）
+阀门-流量模型（内环副对象 Gp2）+ 阀门环节 Gv（限幅 + 死区）
 
-- Gv：阀门指令限幅，将 PID 输出限制在 [u_min, u_max]。
+- Gv：死区（中心跟随设定值）+ 限幅。
 - Gp2：4 路 SISO 一阶惯性（阀门指令 → 流量），方案 A。
 """
 
 import numpy as np
+
+
+def valve_dead_zone(u, center, half_width):
+    """
+    阀门死区：中心跟随设定值，用户仅调半宽。
+    u, center: (4,) 阀门指令与每路死区中心（通常为 setpoints）。
+    half_width: 标量 ≥0，死区半宽 (Nm³/h)；0 表示无死区。
+    连续化：区间内输出 center，区间外平移使特性连续。
+    """
+    u = np.atleast_1d(np.asarray(u, dtype=float)).reshape(4,)
+    center = np.broadcast_to(np.atleast_1d(center), 4).astype(float)
+    hw = float(half_width)
+    if hw <= 0:
+        return u.copy()
+    out = np.where(u > center + hw, u - hw, np.where(u < center - hw, u + hw, center))
+    return out
 
 
 def valve_limit(u, u_min, u_max):
